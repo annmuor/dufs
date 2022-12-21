@@ -40,7 +40,9 @@ async-stream = "0.3"
 walkdir = "2.3"
 form_urlencoded = "1.0"
 alphanumeric-sort = "1.4"
-
+rust-s3 = {features = ["no-verify-ssl"], version = "0.32"}
+rand = "0.8"
+rust-ini = "0.18"
 [features]
 default = ["tls"]
 tls = ["rustls", "rustls-pemfile", "tokio-rustls"]

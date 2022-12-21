@@ -87,7 +87,7 @@ class Uploader {
       ${getSvg()}
     </td>
     <td class="path cell-name">
-      <a href="${url}">${encodedName}</a>
+      <b>${encodedName}</b>
     </td>
     <td class="cell-status upload-status" id="uploadStatus${idx}"></td>
   </tr>`);

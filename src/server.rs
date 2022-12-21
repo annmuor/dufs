@@ -1,11 +1,15 @@
-use crate::streamer::Streamer;
-use crate::utils::{decode_uri, encode_uri, get_file_name, glob, try_get_file_name};
-use crate::{Args, BoxResult};
-use walkdir::WalkDir;
-use xml::escape::escape_str_pcdata;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fs::Metadata;
+use std::io::SeekFrom;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
-use async_zip::write::{EntryOptions, ZipFileWriter};
 use async_zip::Compression;
+use async_zip::write::{EntryOptions, ZipFileWriter};
 use chrono::{TimeZone, Utc};
 use futures::TryStreamExt;
 use headers::{
@@ -13,26 +17,26 @@ use headers::{
     ContentLength, ContentType, ETag, HeaderMap, HeaderMapExt, IfModifiedSince, IfNoneMatch,
     IfRange, LastModified, Range,
 };
+use hyper::{Body, Method, StatusCode, Uri};
 use hyper::header::{
-    HeaderValue, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue,
     RANGE, WWW_AUTHENTICATE,
 };
-use hyper::{Body, Method, StatusCode, Uri};
+use rand::Rng;
+use s3::{Bucket, Region};
+use s3::creds::Credentials;
 use serde::Serialize;
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::fs::Metadata;
-use std::io::SeekFrom;
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::SystemTime;
+use tokio::{fs, io};
 use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWrite};
-use tokio::{fs, io};
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
+use walkdir::WalkDir;
+use xml::escape::escape_str_pcdata;
+
+use crate::{Args, BoxResult};
+use crate::streamer::Streamer;
+use crate::utils::{decode_uri, encode_uri, get_file_name, glob, try_get_file_name};
 
 pub type Request = hyper::Request<Body>;
 pub type Response = hyper::Response<Body>;
@@ -213,7 +217,7 @@ impl Server {
                                 head_only,
                                 &mut res,
                             )
-                            .await?;
+                                .await?;
                         }
                     } else if render_index || render_spa {
                         self.handle_render_index(path, &query_params, headers, head_only, &mut res)
@@ -337,15 +341,15 @@ impl Server {
         mut req: Request,
         res: &mut Response,
     ) -> BoxResult<()> {
-        ensure_path_parent(path).await?;
-
-        let mut file = match fs::File::create(&path).await {
-            Ok(v) => v,
-            Err(_) => {
-                status_forbid(res);
-                return Ok(());
-            }
-        };
+        // ensure_path_parent(path).await?;
+        //
+        // let mut file = match fs::File::create(&path).await {
+        //     Ok(v) => v,
+        //     Err(_) => {
+        //         status_forbid(res);
+        //         return Ok(());
+        //     }
+        // };
 
         let body_with_io_error = req
             .body_mut()
@@ -354,11 +358,28 @@ impl Server {
         let body_reader = StreamReader::new(body_with_io_error);
 
         futures::pin_mut!(body_reader);
-
-        io::copy(&mut body_reader, &mut file).await?;
-
+        let path = Self::random_prefix(&path);
+        // let's read config
+        let bucket = {
+            let ini = ini::Ini::load_from_file(".s3config")?;
+            let bucket = ini.general_section().get("bucket").unwrap();
+            let endpoint = ini.general_section().get("endpoint").unwrap();
+            let access = ini.general_section().get("access_key").unwrap();
+            let secret = ini.general_section().get("secret_key").unwrap();
+            Bucket::new(
+                bucket,
+                Region::Custom { region: endpoint.to_string(), endpoint: endpoint.to_string() },
+                Credentials::new(Some(access), Some(secret), None, None, None)?,
+            )
+        }?;
+        bucket.put_object_stream(&mut body_reader, path).await?;
         *res.status_mut() = StatusCode::CREATED;
         Ok(())
+    }
+
+    fn random_prefix(path: &Path) -> String {
+        let prefix: String = rand::thread_rng().sample_iter(&rand::distributions::Alphanumeric).take(6).map(char::from).collect();
+        format!("{}_{}", prefix, path.file_name().unwrap().to_str().unwrap())
     }
 
     async fn handle_delete(&self, path: &Path, is_dir: bool, res: &mut Response) -> BoxResult<()> {
@@ -379,17 +400,17 @@ impl Server {
         head_only: bool,
         res: &mut Response,
     ) -> BoxResult<()> {
-        let mut paths = vec![];
-        if exist {
-            paths = match self.list_dir(path, path).await {
-                Ok(paths) => paths,
-                Err(_) => {
-                    status_forbid(res);
-                    return Ok(());
-                }
-            }
-        };
-        self.send_index(path, paths, exist, query_params, head_only, res)
+        // let mut paths = vec![];
+        // if exist {
+        //     paths = match self.list_dir(path, path).await {
+        //         Ok(paths) => paths,
+        //         Err(_) => {
+        //             status_forbid(res);
+        //             return Ok(());
+        //         }
+        //     }
+        // };
+        self.send_index(path, vec![], exist, query_params, head_only, res)
     }
 
     async fn handle_search_dir(
@@ -399,47 +420,47 @@ impl Server {
         head_only: bool,
         res: &mut Response,
     ) -> BoxResult<()> {
-        let mut paths: Vec<PathItem> = vec![];
-        let search = query_params.get("q").unwrap().to_lowercase();
-        if !search.is_empty() {
-            let path_buf = path.to_path_buf();
-            let hidden = Arc::new(self.args.hidden.to_vec());
-            let hidden = hidden.clone();
-            let running = self.running.clone();
-            let search_paths = tokio::task::spawn_blocking(move || {
-                let mut it = WalkDir::new(&path_buf).into_iter();
-                let mut paths: Vec<PathBuf> = vec![];
-                while let Some(Ok(entry)) = it.next() {
-                    if !running.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let entry_path = entry.path();
-                    let base_name = get_file_name(entry_path);
-                    let file_type = entry.file_type();
-                    if is_hidden(&hidden, base_name) {
-                        if file_type.is_dir() {
-                            it.skip_current_dir();
-                        }
-                        continue;
-                    }
-                    if !base_name.to_lowercase().contains(&search) {
-                        continue;
-                    }
-                    if entry.path().symlink_metadata().is_err() {
-                        continue;
-                    }
-                    paths.push(entry_path.to_path_buf());
-                }
-                paths
-            })
-            .await?;
-            for search_path in search_paths.into_iter() {
-                if let Ok(Some(item)) = self.to_pathitem(search_path, path.to_path_buf()).await {
-                    paths.push(item);
-                }
-            }
-        }
-        self.send_index(path, paths, true, query_params, head_only, res)
+        // let mut paths: Vec<PathItem> = vec![];
+        // let search = query_params.get("q").unwrap().to_lowercase();
+        // if !search.is_empty() {
+        //     let path_buf = path.to_path_buf();
+        //     let hidden = Arc::new(self.args.hidden.to_vec());
+        //     let hidden = hidden.clone();
+        //     let running = self.running.clone();
+        //     let search_paths = tokio::task::spawn_blocking(move || {
+        //         let mut it = WalkDir::new(&path_buf).into_iter();
+        //         let mut paths: Vec<PathBuf> = vec![];
+        //         while let Some(Ok(entry)) = it.next() {
+        //             if !running.load(Ordering::SeqCst) {
+        //                 break;
+        //             }
+        //             let entry_path = entry.path();
+        //             let base_name = get_file_name(entry_path);
+        //             let file_type = entry.file_type();
+        //             if is_hidden(&hidden, base_name) {
+        //                 if file_type.is_dir() {
+        //                     it.skip_current_dir();
+        //                 }
+        //                 continue;
+        //             }
+        //             if !base_name.to_lowercase().contains(&search) {
+        //                 continue;
+        //             }
+        //             if entry.path().symlink_metadata().is_err() {
+        //                 continue;
+        //             }
+        //             paths.push(entry_path.to_path_buf());
+        //         }
+        //         paths
+        //     })
+        //         .await?;
+        //     for search_path in search_paths.into_iter() {
+        //         if let Ok(Some(item)) = self.to_pathitem(search_path, path.to_path_buf()).await {
+        //             paths.push(item);
+        //         }
+        //     }
+        // }
+        self.send_index(path, vec![], true, query_params, head_only, res)
     }
 
     async fn handle_zip_dir(
@@ -456,7 +477,7 @@ impl Server {
                 "attachment; filename=\"{}.zip\"",
                 encode_uri(filename),
             ))
-            .unwrap(),
+                .unwrap(),
         );
         res.headers_mut()
             .insert("content-type", HeaderValue::from_static("application/zip"));
@@ -571,6 +592,10 @@ impl Server {
         head_only: bool,
         res: &mut Response,
     ) -> BoxResult<()> {
+        if 2 > 1 {
+            *res.status_mut() = StatusCode::FORBIDDEN;
+            return Ok(())
+        }
         let (file, meta) = tokio::join!(fs::File::open(path), fs::metadata(path),);
         let (mut file, meta) = (file?, meta?);
         let mut use_range = true;
@@ -621,7 +646,7 @@ impl Server {
         let filename = try_get_file_name(path)?;
         res.headers_mut().insert(
             CONTENT_DISPOSITION,
-            HeaderValue::from_str(&format!("inline; filename=\"{}\"", encode_uri(filename),))
+            HeaderValue::from_str(&format!("inline; filename=\"{}\"", encode_uri(filename), ))
                 .unwrap(),
         );
 
@@ -1162,7 +1187,7 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
         }
         paths
     })
-    .await?;
+        .await?;
     for zip_path in zip_paths.into_iter() {
         let filename = match zip_path.strip_prefix(dir).ok().and_then(|v| v.to_str()) {
             Some(v) => v,
